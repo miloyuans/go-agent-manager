@@ -4,7 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	// "path/filepath" // 移除了未使用的导入
 
 	"go-agent-manager/config"
 	"go-agent-manager/db"
@@ -30,22 +30,23 @@ func main() {
 	e := echo.New()
 
 	// 5. 注册全局中间件
-	e.Use(e_middleware.Logger()) // 请求日志
-	e.Use(e_middleware.Recover()) // 崩溃恢复
+	e.Use(e_middleware.Logger())       // 请求日志
+	e.Use(e_middleware.Recover())      // 崩溃恢复
 	e.Use(middleware.CORSMiddleware()) // CORS 允许跨域
 
 	// 6. 静态文件服务 (前端构建后的 dist 目录)
 	// 在生产环境中，Go 后端会托管前端静态文件
-	// 在开发环境中，前端由 Vite Dev Server 提供，这里可以暂时不启用或只用于生产构建
 	frontendPath := config.AppConfig.FrontendStaticPath
-	if _, err := os.Stat(frontendPath); err == nil {
+	
+	// 简单检查目录是否存在
+	if info, err := os.Stat(frontendPath); err == nil && info.IsDir() {
 		// 路由任何不匹配 API 的请求都由 ServeFrontend 处理
+		// 注意：ServeFrontend 内部可能会用到 filepath，但那是 handlers 包的事
 		e.GET("/*", handlers.ServeFrontend())
 		log.Printf("Frontend static file serving enabled from: %s", frontendPath)
 	} else {
-		log.Printf("Frontend static path %s not found or inaccessible. Static file serving disabled. Error: %v", frontendPath, err)
+		log.Printf("Frontend static path %s not found or inaccessible. Static file serving disabled.", frontendPath)
 	}
-
 
 	// 7. API 路由组
 	apiGroup := e.Group("/api")
@@ -55,17 +56,19 @@ func main() {
 
 	// 定义需要管理员角色的路由
 	adminGroup := apiGroup.Group("/admin")
-	adminGroup.Use(middleware.RBACMiddleware("admin")) // 只有 'admin' 角色能访问
+	// 注意：确保您的 Keycloak 用户拥有 'admin' 角色，否则这里会返回 403
+	// 如果还在开发调试阶段，可以暂时注释掉 RBACMiddleware
+	adminGroup.Use(middleware.RBACMiddleware("admin")) 
 
 	// --- 设备管理 (需要管理员角色) ---
 	adminGroup.GET("/devices", handlers.GetDevices)
-	adminGroup.POST("/devices", handlers.CreateDevice) // Agent 上报设备也可以走这里，如果 Agent 也是用户身份
+	adminGroup.POST("/devices", handlers.CreateDevice)
 	adminGroup.PUT("/devices/:id", handlers.UpdateDevice)
 	adminGroup.DELETE("/devices/:id", handlers.DeleteDevice)
 
 	// --- 用户管理 (需要管理员角色) ---
-	adminGroup.GET("/users", handlers.GetUsers) // 从 Keycloak 获取用户列表
-	adminGroup.PUT("/users/:id/status", handlers.UpdateUserStatus) // 启用/禁用 Keycloak 用户
+	adminGroup.GET("/users", handlers.GetUsers)
+	adminGroup.PUT("/users/:id/status", handlers.UpdateUserStatus)
 
 	// --- 绑定管理 (需要管理员角色) ---
 	adminGroup.GET("/bindings", handlers.GetBindings)
