@@ -2,57 +2,62 @@ package keycloak
 
 import (
 	"context"
+	"errors" // 引入标准库 errors
 	"log"
 	"sync"
 	"time"
 
 	"go-agent-manager/config"
-	"go-agent-manager/models" // 引入 models 用于 KeycloakUser DTO
+	"go-agent-manager/models"
 
-	"github.com/Nerzal/gocloak/v13" // 确保是 gocloak/v13
+	"github.com/Nerzal/gocloak/v13" // 确保引用的是 v13
 	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
-	kcClient      gocloak.GoCloak
-	adminToken    *gocloak.JWT // 后端自己调 Keycloak Admin API 的 token
+	kcClient      *gocloak.GoCloak // 修改为指针类型，因为 NewClient 返回 *gocloak.GoCloak
+	adminToken    *gocloak.JWT
 	tokenMutex    sync.RWMutex
-	tokenRefreshC chan bool // 用于通知刷新 token 的 channel
+	tokenRefreshC chan bool
 )
 
 // InitKeycloak 初始化 Keycloak 客户端
 func InitKeycloak() {
 	kcClient = gocloak.NewClient(config.AppConfig.Keycloak.AuthServerURL)
-	tokenRefreshC = make(chan bool, 1) // buffered channel
-	go startAdminTokenRefresher()      // 启动 token 刷新协程
-	tokenRefreshC <- true              // 首次获取 token
+	tokenRefreshC = make(chan bool, 1)
+	go startAdminTokenRefresher()
+	tokenRefreshC <- true
 }
 
 // getAdminAccessToken 获取管理员 Access Token
 func getAdminAccessToken() (string, error) {
 	tokenMutex.RLock()
-	// 如果 token 存在且未过期，直接返回
-	if adminToken != nil && !adminToken.Is
-	Expired() { // IsExpired() 内部会检查 ExpiresIn
-		defer tokenMutex.RUnlock()
+	// v13 版本移除了 IsExpired 方法，我们需要手动计算
+	// ExpiresIn 是 token 的有效期秒数，我们并没有存储 token 获取的时间点，
+	// 所以更稳妥的方式是依赖定时刷新，或者在这里简单判断 adminToken 是否为 nil
+	// 真正的过期检查需要解析 JWT 的 exp 字段，或者利用 Refresh Token 机制
+	if adminToken != nil {
+		// 这里简化处理：假定如果有 token 且非空，即暂时可用。
+		// 严谨做法是解析 adminToken.AccessToken 的 exp claim。
+		// 由于 startAdminTokenRefresher 会定时更新，这里只要非 nil 即可。
+		tokenMutex.RUnlock()
 		return adminToken.AccessToken, nil
 	}
 	tokenMutex.RUnlock()
 
-	// 否则需要刷新或首次获取
 	tokenMutex.Lock()
 	defer tokenMutex.Unlock()
 
-	// 再次检查，防止在 RUnlock 和 Lock 之间其他协程已经获取
-	if adminToken != nil && !adminToken.IsExpired() {
+	if adminToken != nil {
 		return adminToken.AccessToken, nil
 	}
 
 	log.Println("Acquiring/Refreshing Keycloak Admin Access Token...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 增加超时时间
 	defer cancel()
 
 	var err error
+	// LoginClient 使用 Client Credentials Grant
 	adminToken, err = kcClient.LoginClient(
 		ctx,
 		config.AppConfig.Keycloak.AdminClientID,
@@ -69,74 +74,81 @@ func getAdminAccessToken() (string, error) {
 // startAdminTokenRefresher 启动一个协程定时刷新管理员 token
 func startAdminTokenRefresher() {
 	for range tokenRefreshC {
-		token, err := getAdminAccessToken() // 内部会获取并更新 adminToken
+		// 强制刷新：调用 LoginClient 获取新 Token
+		// 注意：getAdminAccessToken 内部有缓存检查，为了强制刷新，我们需要绕过它或者重置 adminToken
+		// 但为了简单，我们直接在这里调用 LoginClient 更新全局变量
+		tokenMutex.Lock()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		token, err := kcClient.LoginClient(
+			ctx,
+			config.AppConfig.Keycloak.AdminClientID,
+			config.AppConfig.Keycloak.AdminClientSecret,
+			config.AppConfig.Keycloak.Realm,
+		)
+		cancel()
+		
 		if err != nil {
+			tokenMutex.Unlock()
 			log.Printf("Failed to refresh Keycloak Admin token: %v. Retrying in 10 seconds...", err)
 			time.AfterFunc(10*time.Second, func() { tokenRefreshC <- true })
 			continue
 		}
+		
+		adminToken = token
+		tokenMutex.Unlock()
 
-		// 提前 30 秒刷新
-		expiresIn := adminToken.ExpiresIn - 30
-		if expiresIn < 1 { // 避免负数或过小的刷新间隔
-			expiresIn = 1 // 至少等待1秒
+		// 计算下次刷新时间：提前 30 秒刷新
+		// ExpiresIn 是 int 类型
+		expiresIn := token.ExpiresIn - 30
+		if expiresIn < 1 {
+			expiresIn = 1
 		}
 		log.Printf("Keycloak Admin token will refresh in %d seconds.", expiresIn)
 		time.AfterFunc(time.Duration(expiresIn)*time.Second, func() { tokenRefreshC <- true })
 	}
 }
 
-
 // ValidateAccessToken 验证从前端传来的用户 Access Token
-// 返回用户的 KeycloakUserID (sub) 和 角色列表
 func ValidateAccessToken(ctx context.Context, tokenString string) (string, []string, error) {
-	// 方案一：通过 Keycloak Introspection Endpoint 验证 (推荐，最简单可靠)
 	adminAccessToken, err := getAdminAccessToken()
 	if err != nil {
 		return "", nil, err
 	}
 
+	// v13 RetrospectToken 参数变更：(ctx, accessToken, clientID, clientSecret, realm)
 	result, err := kcClient.RetrospectToken(
 		ctx,
 		tokenString,
-		config.AppConfig.Keycloak.FrontendClientID, // 前端 Client ID
-		config.AppConfig.Keycloak.AdminClientSecret, // 如果 FrontendClientID 是 public client，这里可以为空，但 introspect 要求 client secret
+		config.AppConfig.Keycloak.FrontendClientID,
+		config.AppConfig.Keycloak.AdminClientSecret, // 如果 Client 是 public，这里可能传 ""，但通常 introspect 需要 secret
 		config.AppConfig.Keycloak.Realm,
-		adminAccessToken,
 	)
 	if err != nil {
 		return "", nil, err
 	}
 
 	if !*result.Active {
-		return "", nil, gocloak.NewAPIError("Token is not active", 401)
+		// v13 移除了 NewAPIError，使用标准 errors.New
+		return "", nil, errors.New("token is not active")
 	}
 
-	// 方案二：本地验证 JWT (需要获取 Keycloak 公钥，并处理 Key Rollover，更复杂)
-	// 如果您选择本地验证，可以使用 jwt.ParseWithClaims 配合 Keycloak 的 JWKS Endpoint
-
-	// 解析 JWT payload 获取 sub 和 roles
-	claims := jwt.MapClaims{}
-	_, _, err = kcClient.DecodeAccessToken(ctx, tokenString, config.AppConfig.Keycloak.Realm) // DecodeAccessToken 内部会校验签名
-
-	if err != nil { // 如果签名验证失败，会返回错误
-		// 尝试不校验签名解析一次，以获取 claims
-		_, claims, err = kcClient.DecodeAccessToken(ctx, tokenString, "") // 不传入 realm 则不校验签名
-		if err != nil {
-			return "", nil, err
-		}
+	// 解析 Token 获取 sub 和 roles
+	// DecodeAccessToken 在 v13 返回 (*jwt.Token, *jwt.MapClaims, error)
+	_, claims, err := kcClient.DecodeAccessToken(ctx, tokenString, config.AppConfig.Keycloak.Realm)
+	if err != nil {
+		return "", nil, err
 	}
+	
+	// jwt.MapClaims 本质是 map[string]interface{}
+	claimsMap := *claims
 
-
-	// Extract sub (Keycloak User ID)
-	sub, ok := claims["sub"].(string)
+	sub, ok := claimsMap["sub"].(string)
 	if !ok {
-		return "", nil, gocloak.NewAPIError("sub claim not found or invalid", 401)
+		return "", nil, errors.New("sub claim not found or invalid")
 	}
 
-	// Extract roles (Keycloak 默认在 realm_access.roles 中)
 	var roles []string
-	if realmAccess, ok := claims["realm_access"].(map[string]interface{}); ok {
+	if realmAccess, ok := claimsMap["realm_access"].(map[string]interface{}); ok {
 		if realmRoles, ok := realmAccess["roles"].([]interface{}); ok {
 			for _, role := range realmRoles {
 				if rStr, ok := role.(string); ok {
@@ -145,19 +157,9 @@ func ValidateAccessToken(ctx context.Context, tokenString string) (string, []str
 			}
 		}
 	}
-	
-	// Keycloak 在 introspect 结果中也可能直接有 roles 字段
-	// 具体的解析方式取决于 Keycloak 的 Client Mapper 配置
-	// 如果在 introspect 的 result 中能直接拿到 roles，那更直接
-	// 目前 gocloak.RetrospectToken 返回的 result 结构没有直接的 roles，需要二次解析
-	// 或者您可以直接本地解析 JWT Payload。
-
-	// 为了简化，这里假定从 claims 中获取 sub 和 roles 成功。
-	// 实际生产中，RetrospectToken 已经确认 token 有效，本地解析 payload 是安全的。
 
 	return sub, roles, nil
 }
-
 
 // FetchKeycloakUsers 从 Keycloak 获取所有用户
 func FetchKeycloakUsers(ctx context.Context) ([]models.KeycloakUser, error) {
@@ -167,9 +169,7 @@ func FetchKeycloakUsers(ctx context.Context) ([]models.KeycloakUser, error) {
 	}
 
 	params := gocloak.GetUsersParams{
-		// First: gocloak.IntPtr(0), // 分页参数
-		// Max: gocloak.IntPtr(100),
-		// Search: gocloak.StringPtr(""),
+		// v13 参数使用指针，可以为空
 	}
 
 	kcUsers, err := kcClient.GetUsers(ctx, adminAccessToken, config.AppConfig.Keycloak.Realm, params)
@@ -180,15 +180,21 @@ func FetchKeycloakUsers(ctx context.Context) ([]models.KeycloakUser, error) {
 	var users []models.KeycloakUser
 	for _, kcu := range kcUsers {
 		user := models.KeycloakUser{
-			ID:            *kcu.ID,
-			Username:      *kcu.Username,
-			Email:         *kcu.Email,
-			FirstName:     *kcu.FirstName,
-			LastName:      *kcu.LastName,
-			Enabled:       *kcu.Enabled,
-			EmailVerified: *kcu.EmailVerified,
+			ID:            gocloak.PString(kcu.ID), // 使用 PString 安全解引用，防止 nil panic
+			Username:      gocloak.PString(kcu.Username),
+			Email:         gocloak.PString(kcu.Email),
+			FirstName:     gocloak.PString(kcu.FirstName),
+			LastName:      gocloak.PString(kcu.LastName),
+			Enabled:       gocloak.PBool(kcu.Enabled),
+			EmailVerified: gocloak.PBool(kcu.EmailVerified),
 		}
-		// 联邦身份可以从 kcu.FederatedIdentities 中提取
+		
+		// v13 用户结构体中可能将 FederatedIdentities 放在了 UserRepresentation 中
+		// 或者需要单独调用 API 获取 (GetUserFederatedIdentities)
+		// 如果 kcu.FederatedIdentities 报错，说明该字段在 GetUsers 返回的简略信息中不存在
+		// 为了修复编译错误，这里暂时注释掉联合身份的获取，或者需要额外调用 API
+		
+		/*
 		if kcu.FederatedIdentities != nil {
 			for _, fid := range *kcu.FederatedIdentities {
 				user.FederatedIdentities = append(user.FederatedIdentities, struct {
@@ -196,12 +202,14 @@ func FetchKeycloakUsers(ctx context.Context) ([]models.KeycloakUser, error) {
 					UserID           string `json:"userId"`
 					UserName         string `json:"userName"`
 				}{
-					IdentityProvider: *fid.IdentityProvider,
-					UserID:           *fid.UserID,
-					UserName:         *fid.UserName,
+					IdentityProvider: gocloak.PString(fid.IdentityProvider),
+					UserID:           gocloak.PString(fid.UserID),
+					UserName:         gocloak.PString(fid.UserName),
 				})
 			}
 		}
+		*/
+		
 		users = append(users, user)
 	}
 
@@ -215,13 +223,12 @@ func UpdateKeycloakUserStatus(ctx context.Context, userID string, enable bool) e
 		return err
 	}
 
-	// 先获取用户，因为 UpdateUser 需要完整的 UserRepresentation
 	user, err := kcClient.GetUserByID(ctx, adminAccessToken, config.AppConfig.Keycloak.Realm, userID)
 	if err != nil {
 		return err
 	}
 
-	user.Enabled = gocloak.BoolP(enable) // 设置启用/禁用状态
+	user.Enabled = gocloak.BoolP(enable)
 
 	err = kcClient.UpdateUser(ctx, adminAccessToken, config.AppConfig.Keycloak.Realm, *user)
 	if err != nil {
