@@ -3,12 +3,16 @@ package handlers
 import (
 	"context"
 	"net/http"
-	"go-agent-manager/keycloak" // 引入 keycloak 模块
+	"time" // 添加了缺失的 time 包
+
+	"go-agent-manager/keycloak"
+
 	"github.com/labstack/echo/v4"
 )
 
 // GetUsers 获取 Keycloak 用户列表
 func GetUsers(c echo.Context) error {
+	// 创建一个带超时的 Context，防止请求 Keycloak 卡死
 	ctx, cancel := context.WithTimeout(c.Request().Context(), 10*time.Second)
 	defer cancel()
 
